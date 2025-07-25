@@ -120,7 +120,7 @@ abstract class WorldRendererMixin implements SmoothWorldRenderer {
         GL20.glDisableVertexAttribArray(2); // color
         GL20.glDisableVertexAttribArray(3); // normal
 
-        GL30.glBindVertexArray(0);
+        // VAO bind removed for M1 Mac compatibility
         GL15.glBindBuffer(GL15.GL_ARRAY_BUFFER, 0);
         GL15.glBindBuffer(GL15.GL_ELEMENT_ARRAY_BUFFER, 0);
     }

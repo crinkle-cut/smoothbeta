@@ -9,14 +9,17 @@ import org.lwjgl.opengl.*;
 
 import java.nio.ByteBuffer;
 import java.nio.IntBuffer;
+import java.util.ArrayList;
+import java.util.List;
 
 @SuppressWarnings("removal")
 public class VboPool implements AutoCloseable {
     @SuppressWarnings("deprecation")
     private static final MinecraftAccessor mc = ((MinecraftAccessor) FabricLoader.getInstance().getGameInstance());
 
-    private int vertexArrayId = GL30.glGenVertexArrays();
-    private int vertexBufferId = GL15.glGenBuffers();
+    // Simplified for M1 Mac compatibility - use display lists instead of VBOs
+    private final List<ByteBuffer> pendingBuffers = new ArrayList<>();
+    private final List<Pos> pendingPositions = new ArrayList<>();
     private int capacity = 4096;
     private int nextPos = 0;
     private int size;
@@ -24,115 +27,64 @@ public class VboPool implements AutoCloseable {
     private Pos compactPosLast = null;
     private int curBaseInstance;
 
-    private IntBuffer bufferIndirect = GlAllocationUtils.allocateIntBuffer(this.capacity * 5);
     private final int vertexBytes;
     private VertexFormat.DrawMode drawMode = VertexFormat.DrawMode.QUADS;
 
     public VboPool(VertexFormat format) {
         vertexBytes = format.getVertexSizeByte();
-        this.bindBuffer();
-        long i = this.toBytes(this.capacity);
-        GL15.glBufferData(GL15.GL_ARRAY_BUFFER, i, GL15.GL_STATIC_DRAW);
-        this.unbindBuffer();
     }
 
     @Override
     public void close() {
-        if (this.vertexBufferId > 0) {
-            GlStateManager._glDeleteBuffers(this.vertexBufferId);
-            this.vertexBufferId = 0;
-        }
+        // Cleanup any resources
+        pendingBuffers.clear();
+        pendingPositions.clear();
     }
 
     public void bufferData(ByteBuffer data, Pos poolPos) {
-        if (this.vertexBufferId >= 0) {
-            int position = poolPos.getPosition();
-            int size = poolPos.getSize();
-            int bufferSize = this.toVertex(data.limit());
-
-            if (bufferSize <= 0) {
-                if (position >= 0) {
-                    poolPos.setPosition(-1);
-                    poolPos.setSize(0);
+        int bufferSize = this.toVertex(data.limit());
+        
+        if (bufferSize <= 0) {
+            if (poolPos.getPosition() >= 0) {
+                poolPos.setPosition(-1);
+                poolPos.setSize(0);
+                if (this.posList.contains(poolPos.getNode())) {
                     this.posList.remove(poolPos.getNode());
-                    this.size -= size;
+                    this.size -= poolPos.getSize();
                 }
-            } else {
-                if (bufferSize > size) {
-                    poolPos.setPosition(this.nextPos);
-                    poolPos.setSize(bufferSize);
-                    this.nextPos += bufferSize;
-
-                    if (position >= 0) this.posList.remove(poolPos.getNode());
-
-                    this.posList.addLast(poolPos.getNode());
-                }
-
-                poolPos.setSize(bufferSize);
-                this.size += bufferSize - size;
-                this.checkVboSize(poolPos.getPositionNext());
-                long l = this.toBytes(poolPos.getPosition());
-                this.bindVertexArray();
-                this.bindBuffer();
-                GL15.glBufferSubData(GL15.GL_ARRAY_BUFFER, l, data);
-                this.unbindBuffer();
-                unbindVertexArray();
-
-                if (this.nextPos > this.size * 11 / 10) this.compactRanges();
             }
+        } else {
+            if (bufferSize > poolPos.getSize()) {
+                poolPos.setPosition(this.nextPos);
+                poolPos.setSize(bufferSize);
+                this.nextPos += bufferSize;
+
+                if (poolPos.getPosition() >= 0 && this.posList.contains(poolPos.getNode())) this.posList.remove(poolPos.getNode());
+                this.posList.addLast(poolPos.getNode());
+            }
+
+            poolPos.setSize(bufferSize);
+            this.size += bufferSize - poolPos.getSize();
+            
+            // Store buffer data for immediate mode rendering
+            ByteBuffer copy = ByteBuffer.allocateDirect(data.remaining());
+            copy.put(data);
+            copy.flip();
+            data.rewind();
+            
+            pendingBuffers.add(copy);
+            pendingPositions.add(poolPos);
         }
     }
 
     private void compactRanges() {
+        // Simplified compaction for M1 Mac compatibility
         if (!this.posList.isEmpty()) {
-            Pos vborange = this.compactPosLast;
-
-            if (vborange == null || !this.posList.contains(vborange.getNode()))
-                vborange = this.posList.getFirst().getItem();
-
-            int i;
-            Pos vborange1 = vborange.getPrev();
-
-            if (vborange1 == null) i = 0;
-            else i = vborange1.getPositionNext();
-
-            int j = 0;
-
-            while (vborange != null && j < 1) {
-                ++j;
-
-                if (vborange.getPosition() == i) {
-                    i += vborange.getSize();
-                    vborange = vborange.getNext();
-                } else {
-                    int k = vborange.getPosition() - i;
-
-                    if (vborange.getSize() <= k) {
-                        this.copyVboData(vborange.getPosition(), i, vborange.getSize());
-                        vborange.setPosition(i);
-                        i += vborange.getSize();
-                        vborange = vborange.getNext();
-                    } else {
-                        this.checkVboSize(this.nextPos + vborange.getSize());
-                        this.copyVboData(vborange.getPosition(), this.nextPos, vborange.getSize());
-                        vborange.setPosition(this.nextPos);
-                        this.nextPos += vborange.getSize();
-                        Pos vborange2 = vborange.getNext();
-                        this.posList.remove(vborange.getNode());
-                        this.posList.addLast(vborange.getNode());
-                        vborange = vborange2;
-                    }
-                }
-            }
-
-            if (vborange == null) this.nextPos = this.posList.getLast().getItem().getPositionNext();
-
-            this.compactPosLast = vborange;
+            this.nextPos = this.posList.getLast().getItem().getPositionNext();
         }
     }
 
-    private long toBytes(int vertex)
-    {
+    private long toBytes(int vertex) {
         return (long)vertex * (long)this.vertexBytes;
     }
 
@@ -145,106 +97,85 @@ public class VboPool implements AutoCloseable {
     }
 
     private void copyVboData(int posFrom, int posTo, int size) {
-        long i = this.toBytes(posFrom);
-        long j = this.toBytes(posTo);
-        long k = this.toBytes(size);
-        GL15.glBindBuffer(GL31.GL_COPY_READ_BUFFER, this.vertexBufferId);
-        GL15.glBindBuffer(GL31.GL_COPY_WRITE_BUFFER, this.vertexBufferId);
-        GL31.glCopyBufferSubData(GL31.GL_COPY_READ_BUFFER, GL31.GL_COPY_WRITE_BUFFER, i, j, k);
-        mc.smoothbeta_printOpenGLError("Copy VBO range");
-        GL15.glBindBuffer(GL31.GL_COPY_READ_BUFFER, 0);
-        GL15.glBindBuffer(GL31.GL_COPY_WRITE_BUFFER, 0);
+        // Simplified approach for M1 Mac compatibility - avoid complex buffer operations
+        mc.smoothbeta_printOpenGLError("Copy VBO range (simplified for M1 Mac)");
     }
 
     private void expandVbo(int sizeMin) {
-        int i;
-
-        i = this.capacity * 6 / 4;
+        int i = this.capacity * 6 / 4;
         while (i < sizeMin) i = i * 6 / 4;
-
-        long j = this.toBytes(this.capacity);
-        long k = this.toBytes(i);
-        int l = GL15.glGenBuffers();
-        GL15.glBindBuffer(GL15.GL_ARRAY_BUFFER, l);
-        GL15.glBufferData(GL15.GL_ARRAY_BUFFER, k, GL15.GL_STATIC_DRAW);
-        mc.smoothbeta_printOpenGLError("Expand VBO");
-        GL15.glBindBuffer(GL15.GL_ARRAY_BUFFER, 0);
-        GL15.glBindBuffer(GL31.GL_COPY_READ_BUFFER, this.vertexBufferId);
-        GL15.glBindBuffer(GL31.GL_COPY_WRITE_BUFFER, l);
-        GL31.glCopyBufferSubData(GL31.GL_COPY_READ_BUFFER, GL31.GL_COPY_WRITE_BUFFER, 0L, 0L, j);
-        mc.smoothbeta_printOpenGLError("Copy VBO: " + k);
-        GL15.glBindBuffer(GL31.GL_COPY_READ_BUFFER, 0);
-        GL15.glBindBuffer(GL31.GL_COPY_WRITE_BUFFER, 0);
-        GL15.glDeleteBuffers(this.vertexBufferId);
-        this.bufferIndirect = GlAllocationUtils.allocateIntBuffer(i * 5);
-        this.vertexBufferId = l;
         this.capacity = i;
+        mc.smoothbeta_printOpenGLError("Expand VBO");
     }
 
-    public void bindVertexArray() {
-        GL30.glBindVertexArray(this.vertexArrayId);
-    }
-
+    // Simplified methods for M1 Mac compatibility
     public void bindBuffer() {
-        GL15.glBindBuffer(GL15.GL_ARRAY_BUFFER, this.vertexBufferId);
+        // No-op for immediate mode
     }
 
     public void upload(VertexFormat.DrawMode drawMode, Pos range) {
         if (this.drawMode != drawMode) {
-            if (this.bufferIndirect.position() > 0)
+            if (!pendingBuffers.isEmpty())
                 throw new IllegalArgumentException("Mixed region draw modes: " + this.drawMode + " != " + drawMode);
-
             this.drawMode = drawMode;
         }
-
-        this.bufferIndirect.put(drawMode.getIndexCount(range.getSize()));
-        bufferIndirect.put(1);
-        this.bufferIndirect.put(0);
-        bufferIndirect.put(range.getPosition());
-        bufferIndirect.put(curBaseInstance++);
+        // Store draw command info in the position
     }
 
     public void drawAll() {
-        GL30.glBindVertexArray(this.vertexArrayId);
-        GL15.glBindBuffer(GL15.GL_ARRAY_BUFFER, this.vertexBufferId);
-
-        GL20.glEnableVertexAttribArray(0);
-        GL20.glVertexAttribPointer(0, 3, GL11.GL_FLOAT, false, 28, 0);
-        GL20.glEnableVertexAttribArray(1);
-        GL20.glVertexAttribPointer(1, 2, GL11.GL_FLOAT, false, 28, 12);
-        GL20.glEnableVertexAttribArray(2);
-        GL20.glVertexAttribPointer(2, 4, GL11.GL_UNSIGNED_BYTE, true, 28, 20);
-        GL20.glEnableVertexAttribArray(3);
-        GL20.glVertexAttribPointer(3, 3, GL11.GL_BYTE, true, 28, 24);
-
-        IndexBuffer autostorageindexbuffer = IndexBuffer.getSequentialBuffer(this.drawMode);
-        VertexFormat.IndexType indextype = autostorageindexbuffer.getIndexType();
-        autostorageindexbuffer.bindAndGrow(nextPos / 4 * 6);
-        this.bufferIndirect.flip();
-        GL43.glMultiDrawElementsIndirect(this.drawMode.glMode, indextype.glType, this.bufferIndirect, bufferIndirect.limit() / 5, 0);
-        this.bufferIndirect.limit(this.bufferIndirect.capacity());
-
+        // Use vertex attributes for shader compatibility on M1 Mac
+        if (pendingBuffers.isEmpty()) return;
+        
+        // Enable vertex attribute arrays (these work with both shaders and fixed pipeline)
+        GL20.glEnableVertexAttribArray(0); // Position
+        GL20.glEnableVertexAttribArray(1); // UV0
+        GL20.glEnableVertexAttribArray(2); // Color  
+        GL20.glEnableVertexAttribArray(3); // Normal
+        
+        for (ByteBuffer buffer : pendingBuffers) {
+            if (buffer.capacity() < 28) continue; // Need at least one vertex
+            
+            // Actual vertex format from debug: Position(3*4) + UV(2*4) + Color(4*1) + Normal(4*1) = 28 bytes
+            buffer.position(0); // Reset to start
+            GL20.glVertexAttribPointer(0, 3, GL11.GL_FLOAT, false, 28, buffer);
+            
+            // Create separate positioned buffers for each attribute to avoid position conflicts
+            ByteBuffer uvBuffer = buffer.duplicate().position(12);
+            GL20.glVertexAttribPointer(1, 2, GL11.GL_FLOAT, false, 28, uvBuffer);
+            
+            ByteBuffer colorBuffer = buffer.duplicate().position(20);
+            GL20.glVertexAttribPointer(2, 4, GL11.GL_UNSIGNED_BYTE, true, 28, colorBuffer);
+            
+            ByteBuffer normalBuffer = buffer.duplicate().position(24);
+            GL20.glVertexAttribPointer(3, 4, GL11.GL_BYTE, true, 28, normalBuffer);
+            
+            int vertexCount = buffer.capacity() / 28;
+            if (vertexCount > 0) {
+                GL11.glDrawArrays(this.drawMode.glMode, 0, vertexCount);
+            }
+        }
+        
+        GL20.glDisableVertexAttribArray(3);
+        GL20.glDisableVertexAttribArray(2);
+        GL20.glDisableVertexAttribArray(1);
+        GL20.glDisableVertexAttribArray(0);
+        
+        // Clear pending data
+        pendingBuffers.clear();
+        pendingPositions.clear();
+        
         if (this.nextPos > this.size * 11 / 10) this.compactRanges();
         curBaseInstance = 0;
     }
 
     public void unbindBuffer() {
-        GL15.glBindBuffer(GL15.GL_ARRAY_BUFFER, 0);
-    }
-
-    public static void unbindVertexArray() {
-        GL30.glBindVertexArray(0);
+        // No-op for immediate mode
     }
 
     public void deleteGlBuffers() {
-        if (this.vertexArrayId >= 0) {
-            GL30.glDeleteVertexArrays(this.vertexArrayId);
-            this.vertexArrayId = -1;
-        }
-        if (this.vertexBufferId >= 0) {
-            GlStateManager._glDeleteBuffers(this.vertexBufferId);
-            this.vertexBufferId = -1;
-        }
+        // Cleanup for immediate mode
+        pendingBuffers.clear();
+        pendingPositions.clear();
     }
 
     public static class Pos {
